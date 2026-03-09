@@ -2471,22 +2471,27 @@ async def stream_chat_completion(
             content_delta = delta_msg.content
             reasoning_delta = delta_msg.reasoning
 
-            # Pipe content through tool parser when both are enabled
-            if tool_parser and content_delta:
-                if not tool_markup_possible and "<" not in content_delta:
-                    tool_accumulated_text += content_delta
+            # Check if tool call markup appears in reasoning or content.
+            # Some models (e.g. Qwen3-Coder) emit <tool_call> directly
+            # inside reasoning without a </think> transition, so we need to
+            # intercept tool call tokens regardless of which field they land in.
+            effective_text = content_delta or reasoning_delta or ""
+            if tool_parser and effective_text:
+                if not tool_markup_possible and "<" not in effective_text:
+                    tool_accumulated_text += effective_text
                 else:
                     if not tool_markup_possible:
                         tool_markup_possible = True
                     tool_previous = tool_accumulated_text
-                    tool_accumulated_text += content_delta
+                    tool_accumulated_text += effective_text
                     tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, content_delta
+                        tool_previous, tool_accumulated_text, effective_text,
                     )
 
                     if tool_result is None:
-                        # Inside tool markup — suppress content but emit reasoning
-                        if reasoning_delta:
+                        # Inside tool markup — suppress content but still emit
+                        # reasoning if the same delta contained both.
+                        if reasoning_delta and content_delta:
                             chunk = ChatCompletionChunk(
                                 id=response_id,
                                 model=request.model,
@@ -2523,7 +2528,14 @@ async def stream_chat_completion(
                         yield f"data: {chunk.model_dump_json()}\n\n"
                         continue
 
-                    content_delta = tool_result.get("content", "")
+                    tool_content = tool_result.get("content", "")
+                    if tool_content:
+                        if reasoning_delta:
+                            reasoning_delta = tool_content
+                            content_delta = None
+                        else:
+                            content_delta = tool_content
+                            reasoning_delta = None
 
             chunk = ChatCompletionChunk(
                 id=response_id,
