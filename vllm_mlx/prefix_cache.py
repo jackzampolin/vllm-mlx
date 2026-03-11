@@ -652,9 +652,19 @@ class BlockAwarePrefixCache:
 
                 keys, values = layer_state["state"]
 
-                # KV cache shape: (batch, n_kv_heads, seq_len, head_dim)
-                # Slice along seq_len dimension (axis 2)
-                seq_len = keys.shape[2] if hasattr(keys, "shape") else 0
+                # KV cache shape varies: 4D (batch, heads, seq, dim) or 3D (heads, seq, dim)
+                # Slice along seq_len dimension (always second-to-last axis)
+                ndim = keys.ndim if hasattr(keys, "ndim") else len(keys.shape) if hasattr(keys, "shape") else 0
+                if ndim == 0:
+                    continue
+                seq_axis = ndim - 2
+                seq_len = keys.shape[seq_axis] if hasattr(keys, "shape") else 0
+
+                # Build dynamic slice tuple for arbitrary dimensionality
+                def _make_slice(tensor, s_start, s_end):
+                    slices = [slice(None)] * tensor.ndim
+                    slices[seq_axis] = slice(s_start, s_end)
+                    return tensor[tuple(slices)]
 
                 if end_idx > seq_len:
                     # Requested range extends beyond available data
@@ -665,11 +675,11 @@ class BlockAwarePrefixCache:
                     actual_end = min(end_idx, seq_len)
                     if start_idx >= actual_end:
                         continue
-                    keys_slice = keys[:, :, start_idx:actual_end, :]
-                    values_slice = values[:, :, start_idx:actual_end, :]
+                    keys_slice = _make_slice(keys, start_idx, actual_end)
+                    values_slice = _make_slice(values, start_idx, actual_end)
                 else:
-                    keys_slice = keys[:, :, start_idx:end_idx, :]
-                    values_slice = values[:, :, start_idx:end_idx, :]
+                    keys_slice = _make_slice(keys, start_idx, end_idx)
+                    values_slice = _make_slice(values, start_idx, end_idx)
 
                 block_slices.append((keys_slice, values_slice))
 
@@ -821,10 +831,12 @@ class BlockAwarePrefixCache:
                 if not layer_keys:
                     continue
 
-                # Concatenate along sequence dimension (axis 2)
-                # Shape: (batch, n_kv_heads, seq_len, head_dim)
-                concat_keys = mx.concatenate(layer_keys, axis=2)
-                concat_values = mx.concatenate(layer_values, axis=2)
+                # Concatenate along sequence dimension
+                # Shape varies: 4D (batch, heads, seq, dim) or 3D (heads, seq, dim)
+                ndim = layer_keys[0].ndim if hasattr(layer_keys[0], "ndim") else len(layer_keys[0].shape)
+                seq_axis = ndim - 2  # seq_len is always second-to-last
+                concat_keys = mx.concatenate(layer_keys, axis=seq_axis)
+                concat_values = mx.concatenate(layer_values, axis=seq_axis)
 
                 # Create KVCache object
                 # Try to use mlx_lm's KVCache.from_state if available
@@ -833,7 +845,7 @@ class BlockAwarePrefixCache:
 
                     # Create new cache and set its state
                     cache = KVCache()
-                    seq_len = concat_keys.shape[2]
+                    seq_len = concat_keys.shape[seq_axis]
 
                     # Set internal state directly
                     # KVCache stores keys/values and offset
@@ -849,7 +861,8 @@ class BlockAwarePrefixCache:
                         def __init__(self, keys, values):
                             self.keys = keys
                             self.values = values
-                            self.offset = keys.shape[2]
+                            ndim = keys.ndim if hasattr(keys, "ndim") else len(keys.shape)
+                            self.offset = keys.shape[ndim - 2]
 
                         @property
                         def state(self):
