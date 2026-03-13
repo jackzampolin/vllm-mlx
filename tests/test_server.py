@@ -3,6 +3,7 @@
 
 import platform
 import sys
+from dataclasses import dataclass
 
 import pytest
 
@@ -273,6 +274,64 @@ class TestHelperFunctions:
         processed, images, videos = extract_multimodal_content(messages)
 
         assert len(videos) == 1
+
+
+class TestStreamingChatCompletion:
+    """Regression tests for SSE chunk generation."""
+
+    @pytest.mark.asyncio
+    async def test_reasoning_streaming_emits_content_and_reasoning(self, monkeypatch):
+        """Reasoning-mode streaming should not crash on normal text deltas."""
+        from vllm_mlx.reasoning import get_parser
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        @dataclass
+        class FakeOutput:
+            new_text: str
+            finished: bool = False
+            finish_reason: str | None = None
+            prompt_tokens: int = 8
+            completion_tokens: int = 0
+
+        class FakeEngine:
+            async def stream_chat(self, messages, **kwargs):
+                del messages, kwargs
+                yield FakeOutput(new_text="<think>")
+                yield FakeOutput(new_text="reasoning", completion_tokens=1)
+                yield FakeOutput(
+                    new_text="</think>answer",
+                    finished=True,
+                    finish_reason="stop",
+                    completion_tokens=2,
+                )
+
+        monkeypatch.setattr(server, "_reasoning_parser", get_parser("qwen3")())
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+
+        request = ChatCompletionRequest(
+            model="mlx-community/Qwen3.5-397B-A17B-4bit",
+            messages=[Message(role="user", content="Hello")],
+            stream=True,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+
+        assert len(chunks) >= 4
+        assert '"role":"assistant"' in chunks[0]
+        assert '"reasoning":"reasoning"' in chunks[1]
+        assert '"content":"answer"' in chunks[2]
+        assert chunks[-1] == "data: [DONE]\n\n"
 
 
 # =============================================================================
