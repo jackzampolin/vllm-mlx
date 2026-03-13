@@ -149,6 +149,7 @@ def _install_chunked_prefill(
     from mlx_lm.generate import (
         Batch,
         _left_pad_prompts,
+        _lazy_extract_cache,
         _make_cache,
         _merge_caches,
         _right_pad_prompts,
@@ -267,8 +268,13 @@ def _install_chunked_prefill(
             inputs = partial["inputs"]
             prompt_cache = partial["cache"]
             remaining = inputs.shape[1]
+            prompt_checkpoint = partial["prompt_checkpoint"]
 
-            n_to_process = min(budget, remaining - 1) if remaining > 1 else 0
+            n_to_process = (
+                min(budget, remaining - prompt_checkpoint)
+                if remaining > prompt_checkpoint
+                else 0
+            )
 
             if n_to_process > 0:
                 self.model(mx.contiguous(inputs[:, :n_to_process]), cache=prompt_cache)
@@ -294,7 +300,7 @@ def _install_chunked_prefill(
                     mx.clear_cache()
 
             # Check if prefill is done (only 1 token left or 0)
-            if inputs.shape[1] <= 1:
+            if inputs.shape[1] <= prompt_checkpoint:
                 # Finalize
                 if partial.get("is_cached"):
                     mx.eval([c.state for c in prompt_cache])
@@ -302,6 +308,28 @@ def _install_chunked_prefill(
 
                 for c in prompt_cache:
                     c.finalize()
+
+                prompt_checkpoint_cb = getattr(
+                    self, "prompt_checkpoint_callback", None
+                )
+                if prompt_checkpoint_cb is not None:
+                    prompt_checkpoint_cb(
+                        [
+                            (
+                                uid,
+                                prompt_checkpoint,
+                                _lazy_extract_cache(prompt_cache, i),
+                            )
+                            for i, uid in enumerate(partial["uids"])
+                        ]
+                    )
+
+                if prompt_checkpoint > 1:
+                    self.model(
+                        inputs[:, : prompt_checkpoint - 1],
+                        cache=prompt_cache,
+                    )
+                    mx.eval([c.state for c in prompt_cache])
                 mx.clear_cache()
 
                 y, logprobs = self._step(
@@ -385,6 +413,7 @@ def _install_chunked_prefill(
                     else:
                         mx.clear_cache()
 
+                    prompt_fields = list(zip(*batch_prompts))
                     (
                         uids,
                         inputs_raw,
@@ -392,10 +421,19 @@ def _install_chunked_prefill(
                         caches,
                         samplers,
                         logits_processors,
-                    ) = zip(*batch_prompts)
+                    ) = prompt_fields[:6]
+                    if len(prompt_fields) >= 7:
+                        prompt_checkpoints = prompt_fields[6]
+                    else:
+                        prompt_checkpoints = (-1,) * len(batch_prompts)
                     lengths = [len(p) for p in inputs_raw]
                     max_length = max(lengths)
                     padding = [max_length - ln for ln in lengths]
+                    prompt_checkpoints = [
+                        (ln - pc if pc > 0 else -pc)
+                        for ln, pc in zip(lengths, prompt_checkpoints)
+                    ]
+                    prompt_checkpoint = max(1, max(prompt_checkpoints))
                     tokens = [mx.array(inp) for inp in inputs_raw]
                     is_cached = not all(c[0].empty() for c in caches)
 
@@ -403,14 +441,23 @@ def _install_chunked_prefill(
 
                     if not is_cached:
                         padded = _left_pad_prompts(inputs_raw, max_length=max_length)
-                        prompt_cache = _make_cache(self.model, padding)
+                        try:
+                            prompt_cache = _make_cache(
+                                self.model,
+                                padding,
+                                getattr(self, "max_kv_size", None),
+                            )
+                        except TypeError:
+                            prompt_cache = _make_cache(self.model, padding)
                     else:
-                        last_inputs = mx.array([p[-1:] for p in inputs_raw])
+                        last_inputs = mx.array(
+                            [p[-prompt_checkpoint:] for p in inputs_raw]
+                        )
                         padded = _right_pad_prompts(inputs_raw, max_length=max_length)
                         prompt_cache = _merge_caches(caches)
                         for c in prompt_cache:
                             c.prepare(
-                                lengths=[ln - 1 for ln in lengths],
+                                lengths=[ln - prompt_checkpoint for ln in lengths],
                                 right_padding=padding,
                             )
 
@@ -435,7 +482,10 @@ def _install_chunked_prefill(
                         _adjusted_pb = _pb - _cached
                         if 0 < _adjusted_pb < padded.shape[1]:
                             _first_chunk = _adjusted_pb
-                    n_to_process = min(_first_chunk, padded.shape[1] - 1)
+                    n_to_process = min(
+                        _first_chunk,
+                        max(0, padded.shape[1] - prompt_checkpoint),
+                    )
                     if n_to_process > 0:
                         self.model(
                             mx.contiguous(padded[:, :n_to_process]),
@@ -454,6 +504,7 @@ def _install_chunked_prefill(
                         "max_tokens": list(max_tokens_list),
                         "samplers": list(samplers),
                         "logits_processors": list(logits_processors),
+                        "prompt_checkpoint": prompt_checkpoint,
                         "processed": n_to_process,
                         "total": max_length,
                         "is_cached": is_cached,

@@ -336,6 +336,112 @@ class TestSchedulerBasic:
         assert scheduler.get_num_running() == 0
         assert not scheduler.has_requests()
 
+    def test_chunked_prefill_handles_prompt_checkpoints(self, monkeypatch):
+        """Chunked prefill should accept mlx-lm's 7-field prompt tuples."""
+        import sys
+        import types
+
+        from vllm_mlx import scheduler as scheduler_module
+
+        class FakeArray:
+            def __init__(self, rows):
+                self.rows = [list(r) for r in rows]
+                width = len(self.rows[0]) if self.rows else 0
+                self.shape = (len(self.rows), width)
+
+            def __getitem__(self, key):
+                row_slice, col_slice = key
+                assert row_slice == slice(None)
+                return FakeArray([row[col_slice] for row in self.rows])
+
+        class FakeCacheEntry:
+            state = ()
+
+            def __init__(self, empty=True):
+                self._empty = empty
+
+            def empty(self):
+                return self._empty
+
+            def finalize(self):
+                return None
+
+            def prepare(self, lengths, right_padding):
+                return None
+
+        class FakeMX:
+            @staticmethod
+            def array(value):
+                if value and isinstance(value[0], list):
+                    return FakeArray(value)
+                return FakeArray([value])
+
+            @staticmethod
+            def contiguous(value):
+                return value
+
+            @staticmethod
+            def eval(*_args):
+                return None
+
+            @staticmethod
+            def clear_cache():
+                return None
+
+            @staticmethod
+            def async_eval(*_args):
+                return None
+
+        fake_generate = types.ModuleType("mlx_lm.generate")
+        fake_generate.Batch = lambda *args, **kwargs: None
+        fake_generate._left_pad_prompts = lambda prompts, max_length: FakeArray(prompts)
+        fake_generate._right_pad_prompts = (
+            lambda prompts, max_length: FakeArray(prompts)
+        )
+        fake_generate._make_cache = (
+            lambda model, padding, max_kv_size=None: [FakeCacheEntry()]
+        )
+        fake_generate._merge_caches = lambda caches: [FakeCacheEntry(empty=False)]
+        fake_generate._lazy_extract_cache = lambda cache, idx: (cache, idx)
+
+        fake_mlx_lm = types.ModuleType("mlx_lm")
+        fake_mlx_lm.generate = fake_generate
+
+        monkeypatch.setitem(sys.modules, "mlx_lm", fake_mlx_lm)
+        monkeypatch.setitem(sys.modules, "mlx_lm.generate", fake_generate)
+        monkeypatch.setattr(scheduler_module, "mx", FakeMX())
+
+        bg = types.SimpleNamespace(
+            _next=lambda: [],
+            remove=lambda *_args, **_kwargs: None,
+            _process_prompts=lambda prompts: None,
+            active_batch=None,
+            completion_batch_size=1,
+            prefill_batch_size=1,
+            prompt_progress_callback=lambda *_args, **_kwargs: None,
+            prompt_checkpoint_callback=None,
+            max_kv_size=None,
+            unprocessed_prompts=[
+                (7, [1, 2, 3, 4, 5, 6], 16, [FakeCacheEntry()], None, [], -3)
+            ],
+            _stats=types.SimpleNamespace(
+                prompt_tokens=0,
+                prompt_time=0.0,
+                generation_time=0.0,
+                generation_tokens=0,
+            ),
+            model=lambda inputs, cache=None: None,
+            _step=lambda *args, **kwargs: (FakeArray([[0]]), [FakeArray([[0]])]),
+        )
+
+        scheduler_module._install_chunked_prefill(bg, budget=2)
+
+        assert bg._next() == []
+        assert bg._partial is not None
+        assert bg._partial["uids"] == [7]
+        assert bg._partial["prompt_checkpoint"] == 3
+        assert bg._partial["processed"] == 2
+
 
 # Integration tests require actual MLX model
 @pytest.mark.integration
