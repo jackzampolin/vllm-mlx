@@ -11,7 +11,7 @@ import json
 import logging
 from pathlib import Path
 
-from .chat_templates import DEFAULT_CHATML_TEMPLATE, NEMOTRON_CHAT_TEMPLATE
+from .chat_templates import DEFAULT_CHATML_TEMPLATE, NEMOTRON_CHAT_TEMPLATE, QWEN35_CHAT_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,12 @@ def _needs_tokenizer_fallback(model_name: str) -> bool:
     """Check if model needs tokenizer fallback."""
     model_lower = model_name.lower()
     return any(pattern.lower() in model_lower for pattern in FALLBACK_MODELS)
+
+
+def _is_qwen35_model(model_name: str) -> bool:
+    """Check if model is a Qwen3.5 variant."""
+    model_lower = model_name.lower()
+    return "qwen3.5" in model_lower or "qwen3-5" in model_lower
 
 
 def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
@@ -85,6 +91,14 @@ def _load_strict_false(model_name: str, tokenizer_config: dict = None):
 
     model, _ = load_model(model_path, strict=False)
     tokenizer = load_tokenizer(model_path, tokenizer_config or {})
+
+    # MLX-quantized Qwen3.5 models strip the chat template from
+    # tokenizer_config.json. Inject the official template with thinking
+    # support so the model produces <think> blocks.
+    if not getattr(tokenizer, "chat_template", None) and _is_qwen35_model(model_name):
+        tokenizer.chat_template = QWEN35_CHAT_TEMPLATE
+        logger.info("Injected Qwen3.5 chat template with thinking support")
+
     return model, tokenizer
 
 
@@ -142,12 +156,13 @@ def _load_with_tokenizer_fallback(model_name: str):
         if chat_template:
             tokenizer.chat_template = chat_template
             logger.info("Chat template loaded from tokenizer_config.json")
+        elif _is_qwen35_model(model_name):
+            tokenizer.chat_template = QWEN35_CHAT_TEMPLATE
+            logger.info("Using Qwen3.5 chat template with thinking support")
         elif _needs_tokenizer_fallback(model_name):
-            # Use official Nemotron chat template with thinking support
             tokenizer.chat_template = NEMOTRON_CHAT_TEMPLATE
             logger.info("Using official Nemotron chat template with thinking support")
         else:
-            # Default simple ChatML format for other models
             tokenizer.chat_template = DEFAULT_CHATML_TEMPLATE
             logger.info("Using default ChatML chat template")
 
